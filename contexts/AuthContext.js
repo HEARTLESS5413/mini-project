@@ -1,12 +1,13 @@
 'use client';
 
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { useUser } from '@clerk/nextjs';
 import { getSupabaseClient } from '@/lib/supabase/client';
 
 const AuthContext = createContext(null);
 
 export function AuthProvider({ children }) {
-    const [user, setUser] = useState(null);
+    const { user: clerkUser, isLoaded, isSignedIn } = useUser();
     const [profile, setProfile] = useState(null);
     const [loading, setLoading] = useState(true);
 
@@ -25,74 +26,66 @@ export function AuthProvider({ children }) {
         return null;
     }, [supabase]);
 
+    const createProfile = useCallback(async (clerkUser) => {
+        const userId = clerkUser.id;
+        const username = clerkUser.username ||
+            (clerkUser.primaryEmailAddress?.emailAddress?.split('@')[0] || '').replace(/[^a-z0-9_]/gi, '') + '_' + userId.slice(-4);
+        const fullName = clerkUser.fullName || '';
+        const avatarUrl = clerkUser.imageUrl || '';
+
+        const { data, error } = await supabase
+            .from('profiles')
+            .upsert({
+                id: userId,
+                username: username.toLowerCase(),
+                full_name: fullName,
+                avatar_url: avatarUrl,
+                updated_at: new Date().toISOString(),
+            }, { onConflict: 'id' })
+            .select()
+            .single();
+
+        if (!error && data) {
+            setProfile(data);
+            return data;
+        }
+        return null;
+    }, [supabase]);
+
     useEffect(() => {
-        const initAuth = async () => {
-            try {
-                const { data: { session } } = await supabase.auth.getSession();
-                if (session?.user) {
-                    setUser(session.user);
-                    await fetchProfile(session.user.id);
-                }
-            } catch (err) {
-                console.error('Auth init error:', err);
+        if (!isLoaded) return;
+        if (!isSignedIn) {
+            setProfile(null);
+            setLoading(false);
+            return;
+        }
+
+        const init = async () => {
+            // Try to fetch existing profile
+            const existing = await fetchProfile(clerkUser.id);
+            if (!existing) {
+                // Create profile if doesn't exist
+                await createProfile(clerkUser);
             }
             setLoading(false);
         };
+        init();
+    }, [isLoaded, isSignedIn, clerkUser, fetchProfile, createProfile]);
 
-        initAuth();
-
-        const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
-            if (session?.user) {
-                setUser(session.user);
-                await fetchProfile(session.user.id);
-            } else {
-                setUser(null);
-                setProfile(null);
-            }
-            setLoading(false);
-        });
-
-        return () => subscription.unsubscribe();
-    }, [supabase, fetchProfile]);
-
-    // Google OAuth
-    const signInWithGoogle = async () => {
-        const { error } = await supabase.auth.signInWithOAuth({
-            provider: 'google',
-            options: { redirectTo: `${window.location.origin}/feed` },
-        });
-        if (error) throw error;
-    };
-
-    // Phone OTP
-    const signInWithPhone = async (phone) => {
-        const { error } = await supabase.auth.signInWithOtp({ phone });
-        if (error) throw error;
-    };
-
-    // Verify OTP
-    const verifyOtp = async (phone, token) => {
-        const { data, error } = await supabase.auth.verifyOtp({ phone, token, type: 'sms' });
-        if (error) throw error;
-        return data;
-    };
-
-    // Update profile
     const updateProfile = async (updates) => {
-        if (!user) return;
+        if (!clerkUser) return;
         const { error } = await supabase
             .from('profiles')
             .update({ ...updates, updated_at: new Date().toISOString() })
-            .eq('id', user.id);
+            .eq('id', clerkUser.id);
         if (error) throw error;
         setProfile(prev => ({ ...prev, ...updates }));
     };
 
-    // Upload avatar
     const uploadAvatar = async (file) => {
-        if (!user) return null;
+        if (!clerkUser) return null;
         const ext = file.name.split('.').pop();
-        const filePath = `${user.id}/avatar.${ext}`;
+        const filePath = `${clerkUser.id}/avatar.${ext}`;
         const { error: uploadError } = await supabase.storage
             .from('avatars')
             .upload(filePath, file, { upsert: true });
@@ -102,25 +95,15 @@ export function AuthProvider({ children }) {
         return data.publicUrl;
     };
 
-    // Sign out
-    const signOut = async () => {
-        await supabase.auth.signOut();
-        setUser(null);
-        setProfile(null);
-    };
-
     return (
         <AuthContext.Provider value={{
-            user,
+            user: clerkUser ? { id: clerkUser.id, email: clerkUser.primaryEmailAddress?.emailAddress } : null,
             profile,
-            loading,
-            signInWithGoogle,
-            signInWithPhone,
-            verifyOtp,
+            loading: loading || !isLoaded,
             updateProfile,
             uploadAvatar,
-            signOut,
             fetchProfile,
+            isSignedIn,
         }}>
             {children}
         </AuthContext.Provider>
